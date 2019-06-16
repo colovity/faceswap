@@ -294,7 +294,7 @@ class Interface():
     def get_state_color(self):
         """ Return a color based on current state
             white - View Mode
-            yellow - Edit Mide
+            yellow - Edit Mode
             red - Unsaved alignments """
         color = (255, 255, 255)
         if self.state["edit"]["updated"]:
@@ -446,7 +446,7 @@ class Manual():
         legacy.process()
 
         logger.info("[MANUAL PROCESSING]")  # Tidy up cli output
-        self.extracted_faces = ExtractedFaces(self.frames, self.alignments,
+        self.extracted_faces = ExtractedFaces(self.frames, self.alignments, size=256,
                                               align_eyes=self.align_eyes)
         self.interface = Interface(self.alignments, self.frames)
         self.help = Help(self.interface)
@@ -461,8 +461,8 @@ class Manual():
         """ Iterate through frames """
         # pylint: disable=no-member
         logger.debug("Display frames")
-        is_windows = True if platform.system() == "Windows" else False
-        is_conda = True if "conda" in sys.version.lower() else False
+        is_windows = platform.system() == "Windows"
+        is_conda = "conda" in sys.version.lower()
         logger.debug("is_windows: %s, is_conda: %s", is_windows, is_conda)
         cv2.namedWindow("Frame")
         cv2.namedWindow("Faces")
@@ -510,8 +510,8 @@ class Manual():
         MS Windows doesn't appear to read the window state property
         properly, so we check for a negative key press.
 
-        Conda (tested on Windows) doesn't sppear to read the window
-        state property or negative key press properly, so we arbitarily
+        Conda (tested on Windows) doesn't appear to read the window
+        state property or negative key press properly, so we arbitrarily
         use another property """
         # pylint: disable=no-member
         logger.trace("Commencing closed window check")
@@ -784,24 +784,25 @@ class MouseHandler():
         d_event = detect_process.event
         detect_process.start()
 
-        for plugin in ("fan", "dlib"):
-            aligner = PluginLoader.get_aligner(plugin)(loglevel=loglevel)
+        for plugin in ("fan", "cv2_dnn"):
+            aligner = PluginLoader.get_aligner(plugin)(loglevel=loglevel,
+                                                       normalize_method="hist")
             align_process = SpawnProcess(aligner.run, **a_kwargs)
             a_event = align_process.event
             align_process.start()
 
-            # Wait for Aligner to take init
+            # Wait for Aligner to initialize
             # The first ever load of the model for FAN has reportedly taken
             # up to 3-4 minutes, hence high timeout.
             a_event.wait(300)
             if not a_event.is_set():
                 if plugin == "fan":
                     align_process.join()
-                    logger.error("Error initializing FAN. Trying Dlib")
+                    logger.error("Error initializing FAN. Trying CV2-DNN")
                     continue
                 else:
                     raise ValueError("Error inititalizing Aligner")
-            if plugin == "dlib":
+            if plugin == "cv2_dnn":
                 break
 
             try:
@@ -812,7 +813,7 @@ class MouseHandler():
             if not err:
                 break
             align_process.join()
-            logger.error("Error initializing FAN. Trying Dlib")
+            logger.error("Error initializing FAN. Trying CV2-DNN")
 
         d_event.wait(10)
         if not d_event.is_set():
@@ -881,6 +882,9 @@ class MouseHandler():
             bounding box and set face_id """
         frame = self.media["frame_id"]
         alignments = self.alignments.get_faces_in_frame(frame)
+        scale = self.interface.get_frame_scaling()
+        pt_x = int(pt_x / scale)
+        pt_y = int(pt_y / scale)
 
         for idx, alignment in enumerate(alignments):
             left = alignment["x"]
@@ -977,14 +981,14 @@ class MouseHandler():
         self.interface.state["edit"]["updated"] = True
         self.interface.state["edit"]["update_faces"] = True
 
-    def extracted_to_alignment(self, extract_data):
+    @staticmethod
+    def extracted_to_alignment(extract_data):
         """ Convert Extracted Tuple to Alignments data """
         alignment = dict()
-        d_rect, landmarks = extract_data
-        alignment["x"] = d_rect.left()
-        alignment["w"] = d_rect.right() - d_rect.left()
-        alignment["y"] = d_rect.top()
-        alignment["h"] = d_rect.bottom() - d_rect.top()
-        alignment["frame_dims"] = self.media["image"].shape[:2]
+        bbox, landmarks = extract_data
+        alignment["x"] = bbox.left
+        alignment["w"] = bbox.width
+        alignment["y"] = bbox.top
+        alignment["h"] = bbox.height
         alignment["landmarksXY"] = landmarks
         return alignment

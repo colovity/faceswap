@@ -3,20 +3,21 @@
 
 import logging
 import os
+import urllib
 import warnings
+import zipfile
+from socket import timeout as socket_timeout, error as socket_error
 
 from hashlib import sha1
 from pathlib import Path
 from re import finditer
-from time import time
 
 import cv2
 import numpy as np
 
-import dlib
+from tqdm import tqdm
 
-from lib.faces_detect import DetectedFace
-from lib.training_data import TrainingDataGenerator
+from lib.faces_detect import BoundingBox, DetectedFace
 from lib.logger import get_loglevel
 
 
@@ -29,10 +30,13 @@ _video_extensions = [  # pylint: disable=invalid-name
     ".avi", ".flv", ".mkv", ".mov", ".mp4", ".mpeg", ".webm"]
 
 
-def get_folder(path):
+def get_folder(path, make_folder=True):
     """ Return a path to a folder, creating it if it doesn't exist """
     logger.debug("Requested path: '%s'", path)
     output_dir = Path(path)
+    if not make_folder and not output_dir.exists():
+        logger.debug("%s does not exist", path)
+        return None
     output_dir.mkdir(parents=True, exist_ok=True)
     logger.debug("Returning: '%s'", output_dir)
     return output_dir
@@ -61,9 +65,62 @@ def get_image_paths(directory):
     return dir_contents
 
 
+def full_path_split(path):
+    """ Split a given path into all of it's separate components """
+    allparts = list()
+    while True:
+        parts = os.path.split(path)
+        if parts[0] == path:   # sentinel for absolute paths
+            allparts.insert(0, parts[0])
+            break
+        elif parts[1] == path:  # sentinel for relative paths
+            allparts.insert(0, parts[1])
+            break
+        else:
+            path = parts[0]
+            allparts.insert(0, parts[1])
+    logger.trace("path: %s, allparts: %s", path, allparts)
+    return allparts
+
+
+def cv2_read_img(filename, raise_error=False):
+    """ Read an image with cv2 and check that an image was actually loaded.
+        Logs an error if the image returned is None. or an error has occured.
+
+        Pass raise_error=True if error should be raised """
+    logger.trace("Requested image: '%s'", filename)
+    success = True
+    image = None
+    try:
+        image = cv2.imread(filename)  # pylint: disable=no-member
+        if image is None:
+            raise ValueError
+    except TypeError:
+        success = False
+        msg = "Error while reading image (TypeError): '{}'".format(filename)
+        logger.error(msg)
+        if raise_error:
+            raise Exception(msg)
+    except ValueError:
+        success = False
+        msg = ("Error while reading image. This is most likely caused by special characters in "
+               "the filename: '{}'".format(filename))
+        logger.error(msg)
+        if raise_error:
+            raise Exception(msg)
+    except Exception as err:  # pylint: disable=broad-except
+        success = False
+        msg = "Failed to load image '{}'. Original Error: {}".format(filename, str(err))
+        logger.error(msg)
+        if raise_error:
+            raise Exception(msg)
+    logger.trace("Loaded image: '%s'. Success: %s", filename, success)
+    return image
+
+
 def hash_image_file(filename):
-    """ Return the filename with it's sha1 hash """
-    img = cv2.imread(filename)  # pylint: disable=no-member
+    """ Return an image file's sha1 hash """
+    img = cv2_read_img(filename, raise_error=True)
     img_hash = sha1(img).hexdigest()
     logger.trace("filename: '%s', hash: %s", filename, img_hash)
     return img_hash
@@ -107,36 +164,15 @@ def set_system_verbosity(loglevel):
     logger.debug("System Verbosity level: %s", loglevel)
     os.environ['TF_CPP_MIN_LOG_LEVEL'] = loglevel
     if loglevel != '0':
-        for warncat in (FutureWarning, DeprecationWarning):
+        for warncat in (FutureWarning, DeprecationWarning, UserWarning):
             warnings.simplefilter(action='ignore', category=warncat)
 
 
-def add_alpha_channel(image, intensity=100):
-    """ Add an alpha channel to an image
-
-        intensity: The opacity of the alpha channel between 0 and 100
-                   100 = transparent,
-                   0 = solid  """
-    logger.trace("Adding alpha channel: intensity: %s", intensity)
-    assert 0 <= intensity <= 100, "Invalid intensity supplied"
-    intensity = (255.0 / 100.0) * intensity
-
-    d_type = image.dtype
-    image = image.astype("float32")
-
-    ch_b, ch_g, ch_r = cv2.split(image)  # pylint: disable=no-member
-    ch_a = np.ones(ch_b.shape, dtype="float32") * intensity
-
-    image_bgra = cv2.merge(  # pylint: disable=no-member
-        (ch_b, ch_g, ch_r, ch_a))
-    logger.trace("Added alpha channel", intensity)
-    return image_bgra.astype(d_type)
-
-
 def rotate_landmarks(face, rotation_matrix):
+    # pylint: disable=c-extension-no-member
     """ Rotate the landmarks and bounding box for faces
         found in rotated images.
-        Pass in a DetectedFace object, Alignments dict or DLib rectangle"""
+        Pass in a DetectedFace object, Alignments dict or BoundingBox"""
     logger.trace("Rotating landmarks: (rotation_matrix: %s, type(face): %s",
                  rotation_matrix, type(face))
     if isinstance(face, DetectedFace):
@@ -156,12 +192,11 @@ def rotate_landmarks(face, rotation_matrix):
                          face.get("y", 0) + face.get("h", 0)]]
         landmarks = face.get("landmarksXY", list())
 
-    elif isinstance(face,
-                    dlib.rectangle):  # pylint: disable=c-extension-no-member
-        bounding_box = [[face.left(), face.top()],
-                        [face.right(), face.top()],
-                        [face.right(), face.bottom()],
-                        [face.left(), face.bottom()]]
+    elif isinstance(face, BoundingBox):
+        bounding_box = [[face.left, face.top],
+                        [face.right, face.top],
+                        [face.right, face.bottom],
+                        [face.left, face.bottom]]
         landmarks = list()
     else:
         raise ValueError("Unsupported face type")
@@ -206,8 +241,7 @@ def rotate_landmarks(face, rotation_matrix):
             rotated_landmarks = [tuple(point) for point in rotated[1].tolist()]
             face["landmarksXY"] = rotated_landmarks
     else:
-        rotated_landmarks = dlib.rectangle(  # pylint: disable=c-extension-no-member
-            int(pt_x), int(pt_y), int(pt_x1), int(pt_y1))
+        rotated_landmarks = BoundingBox(pt_x, pt_y, pt_x1, pt_y1)
         face = rotated_landmarks
 
     logger.trace("Rotated landmarks: %s", rotated_landmarks)
@@ -223,80 +257,6 @@ def camel_case_split(identifier):
     return [m.group(0) for m in matches]
 
 
-class Timelapse:
-    """ Time lapse function for training """
-    @classmethod
-    def create_timelapse(cls, input_dir_a, input_dir_b, output_dir, trainer):
-        """ Create the time lapse """
-        if input_dir_a is None and input_dir_b is None and output_dir is None:
-            return None
-
-        if input_dir_a is None or input_dir_b is None:
-            raise ValueError("To enable the timelapse, you have to supply "
-                             "all the parameters (--timelapse-input-A and "
-                             "--timelapse-input-B).")
-
-        if output_dir is None:
-            output_dir = get_folder(os.path.join(trainer.model.model_dir,
-                                                 "timelapse"))
-
-        return Timelapse(input_dir_a, input_dir_b, output_dir, trainer)
-
-    def __init__(self, input_dir_a, input_dir_b, output, trainer):
-        self.output_dir = output
-        self.trainer = trainer
-
-        if not os.path.isdir(self.output_dir):
-            logger.error("'%s' does not exist", self.output_dir)
-            exit(1)
-
-        self.files_a = self.read_input_images(input_dir_a)
-        self.files_b = self.read_input_images(input_dir_b)
-
-        btchsz = min(len(self.files_a), len(self.files_b))
-
-        self.images_a = self.get_image_data(self.files_a, btchsz)
-        self.images_b = self.get_image_data(self.files_b, btchsz)
-
-    @staticmethod
-    def read_input_images(input_dir):
-        """ Get the image paths """
-        if not os.path.isdir(input_dir):
-            logger.error("'%s' does not exist", input_dir)
-            exit(1)
-
-        if not os.listdir(input_dir):
-            logger.error("'%s' contains no images", input_dir)
-            exit(1)
-
-        return get_image_paths(input_dir)
-
-    def get_image_data(self, input_images, batch_size):
-        """ Get training images """
-        random_transform_args = {
-            'rotation_range': 0,
-            'zoom_range': 0,
-            'shift_range': 0,
-            'random_flip': 0
-        }
-
-        zoom = 1
-        if hasattr(self.trainer.model, 'IMAGE_SHAPE'):
-            zoom = self.trainer.model.IMAGE_SHAPE[0] // 64
-
-        generator = TrainingDataGenerator(random_transform_args, 160, zoom)
-        batch = generator.minibatchAB(input_images, batch_size,
-                                      doShuffle=False)
-
-        return next(batch)[2]
-
-    def work(self):
-        """ Write out timelapse image """
-        image = self.trainer.show_sample(self.images_a, self.images_b)
-        cv2.imwrite(os.path.join(self.output_dir,  # pylint: disable=no-member
-                                 str(int(time())) + ".png"), image)
-
-
 def safe_shutdown():
     """ Close queues, threads and processes in event of crash """
     logger.debug("Safely shutting down")
@@ -309,3 +269,206 @@ def safe_shutdown():
     while not queue_manager._log_queue.empty():  # pylint: disable=protected-access
         continue
     queue_manager.manager.shutdown()
+
+
+class GetModel():
+    """ Check for models in their cache path
+        If available, return the path, if not available, get, unzip and install model
+
+        model_filename: The name of the model to be loaded (see notes below)
+        cache_dir:      The model cache folder of the current plugin calling this class
+                        IE: The folder that holds the model to be loaded.
+        git_model_id:   The second digit in the github tag that identifies this model.
+                        See https://github.com/deepfakes-models/faceswap-models for more
+                        information
+
+        NB: Models must have a certain naming convention:
+            IE: <model_name>_v<version_number>.<extension>
+            EG: s3fd_v1.pb
+
+            Multiple models can exist within the model_filename. They should be passed as a list
+            and follow the same naming convention as above. Any differences in filename should
+            occur AFTER the version number.
+            IE: [<model_name>_v<version_number><differentiating_information>.<extension>]
+            EG: [mtcnn_det_v1.1.py, mtcnn_det_v1.2.py, mtcnn_det_v1.3.py]
+                [resnet_ssd_v1.caffemodel, resnet_ssd_v1.prototext]
+        """
+
+    def __init__(self, model_filename, cache_dir, git_model_id):
+        if not isinstance(model_filename, list):
+            model_filename = [model_filename]
+        self.model_filename = model_filename
+        self.cache_dir = cache_dir
+        self.git_model_id = git_model_id
+        self.url_base = "https://github.com/deepfakes-models/faceswap-models/releases/download"
+        self.chunk_size = 1024  # Chunk size for downloading and unzipping
+        self.retries = 6
+        self.get()
+        self.model_path = self._model_path
+
+    @property
+    def _model_full_name(self):
+        """ Return the model full name from the filename(s) """
+        common_prefix = os.path.commonprefix(self.model_filename)
+        retval = os.path.splitext(common_prefix)[0]
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _model_name(self):
+        """ Return the model name from the model full name """
+        retval = self._model_full_name[:self._model_full_name.rfind("_")]
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _model_version(self):
+        """ Return the model version from the model full name """
+        retval = int(self._model_full_name[self._model_full_name.rfind("_") + 2:])
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _model_path(self):
+        """ Return the model path(s) in the cache folder """
+        retval = [os.path.join(self.cache_dir, fname) for fname in self.model_filename]
+        retval = retval[0] if len(retval) == 1 else retval
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _model_zip_path(self):
+        """ Full path to downloaded zip file """
+        retval = os.path.join(self.cache_dir, "{}.zip".format(self._model_full_name))
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _model_exists(self):
+        """ Check model(s) exist """
+        if isinstance(self._model_path, list):
+            retval = all(os.path.exists(pth) for pth in self._model_path)
+        else:
+            retval = os.path.exists(self._model_path)
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _plugin_section(self):
+        """ Get the plugin section from the config_dir """
+        path = os.path.normpath(self.cache_dir)
+        split = path.split(os.sep)
+        retval = split[split.index("plugins") + 1]
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _url_section(self):
+        """ Return the section ID in github for this plugin type """
+        sections = dict(extract=1, train=2, convert=3)
+        retval = sections[self._plugin_section]
+        logger.trace(retval)
+        return retval
+
+    @property
+    def _url_download(self):
+        """ Base URL for models """
+        tag = "v{}.{}.{}".format(self._url_section, self.git_model_id, self._model_version)
+        retval = "{}/{}/{}.zip".format(self.url_base, tag, self._model_full_name)
+        logger.trace("Download url: %s", retval)
+        return retval
+
+    @property
+    def _url_partial_size(self):
+        """ Return how many bytes have already been downloaded """
+        zip_file = self._model_zip_path
+        retval = os.path.getsize(zip_file) if os.path.exists(zip_file) else 0
+        logger.trace(retval)
+        return retval
+
+    def get(self):
+        """ Check the model exists, if not, download and unzip into location """
+        if self._model_exists:
+            logger.debug("Model exists: %s", self._model_path)
+            return
+        self.download_model()
+        self.unzip_model()
+        os.remove(self._model_zip_path)
+
+    def download_model(self):
+        """ Download model zip to cache dir """
+        logger.info("Downloading model: '%s' from: %s", self._model_name, self._url_download)
+        for attempt in range(self.retries):
+            try:
+                downloaded_size = self._url_partial_size
+                req = urllib.request.Request(self._url_download)
+                if downloaded_size != 0:
+                    req.add_header("Range", "bytes={}-".format(downloaded_size))
+                response = urllib.request.urlopen(req, timeout=10)
+                logger.debug("header info: {%s}", response.info())
+                logger.debug("Return Code: %s", response.getcode())
+                self.write_zipfile(response, downloaded_size)
+                break
+            except (socket_error, socket_timeout,
+                    urllib.error.HTTPError, urllib.error.URLError) as err:
+                if attempt + 1 < self.retries:
+                    logger.warning("Error downloading model (%s). Retrying %s of %s...",
+                                   str(err), attempt + 2, self.retries)
+                else:
+                    logger.error("Failed to download model. Exiting. (Error: '%s', URL: '%s')",
+                                 str(err), self._url_download)
+                    logger.info("You can try running again to resume the download.")
+                    logger.info("Alternatively, you can manually download the model from: %s and "
+                                "unzip the contents to: %s", self._url_download, self.cache_dir)
+                    exit(1)
+
+    def write_zipfile(self, response, downloaded_size):
+        """ Write the model zip file to disk """
+        length = int(response.getheader("content-length")) + downloaded_size
+        if length == downloaded_size:
+            logger.info("Zip already exists. Skipping download")
+            return
+        write_type = "wb" if downloaded_size == 0 else "ab"
+        with open(self._model_zip_path, write_type) as out_file:
+            pbar = tqdm(desc="Downloading",
+                        unit="B",
+                        total=length,
+                        unit_scale=True,
+                        unit_divisor=1024)
+            if downloaded_size != 0:
+                pbar.update(downloaded_size)
+            while True:
+                buffer = response.read(self.chunk_size)
+                if not buffer:
+                    break
+                pbar.update(len(buffer))
+                out_file.write(buffer)
+
+    def unzip_model(self):
+        """ Unzip the model file to the cachedir """
+        logger.info("Extracting: '%s'", self._model_name)
+        try:
+            zip_file = zipfile.ZipFile(self._model_zip_path, "r")
+            self.write_model(zip_file)
+        except Exception as err:  # pylint:disable=broad-except
+            logger.error("Unable to extract model file: %s", str(err))
+            exit(1)
+
+    def write_model(self, zip_file):
+        """ Extract files from zipfile and write, with progress bar """
+        length = sum(f.file_size for f in zip_file.infolist())
+        fnames = zip_file.namelist()
+        logger.debug("Zipfile: Filenames: %s, Total Size: %s", fnames, length)
+        pbar = tqdm(desc="Extracting", unit="B", total=length, unit_scale=True, unit_divisor=1024)
+        for fname in fnames:
+            out_fname = os.path.join(self.cache_dir, fname)
+            logger.debug("Extracting from: '%s' to '%s'", self._model_zip_path, out_fname)
+            zipped = zip_file.open(fname)
+            with open(out_fname, "wb") as out_file:
+                while True:
+                    buffer = zipped.read(self.chunk_size)
+                    if not buffer:
+                        break
+                    pbar.update(len(buffer))
+                    out_file.write(buffer)
+        zip_file.close()

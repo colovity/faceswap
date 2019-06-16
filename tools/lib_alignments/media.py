@@ -10,7 +10,8 @@ import cv2
 
 from lib.alignments import Alignments
 from lib.faces_detect import DetectedFace
-from lib.utils import _image_extensions, _video_extensions, hash_image_file, hash_encode_image
+from lib.utils import (_image_extensions, _video_extensions, cv2_read_img, hash_image_file,
+                       hash_encode_image)
 
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
 
@@ -53,7 +54,7 @@ class AlignmentData(Alignments):
         self.set_destination_format(destination_format)
 
     def set_destination_format(self, destination_format):
-        """ Standardise the destination format to the correct extension """
+        """ Standardize the destination format to the correct extension """
         extensions = {".json": "json",
                       ".p": "pickle",
                       ".yml": "yaml",
@@ -134,7 +135,7 @@ class MediaLoader():
     def valid_extension(filename):
         """ Check whether passed in file has a valid extension """
         extension = os.path.splitext(filename)[1]
-        retval = extension in _image_extensions
+        retval = extension.lower() in _image_extensions
         logger.trace("Filename has valid extension: '%s': %s", filename, retval)
         return retval
 
@@ -160,14 +161,14 @@ class MediaLoader():
         else:
             src = os.path.join(self.folder, filename)
             logger.trace("Loading image: '%s'", src)
-            image = cv2.imread(src)  # pylint: disable=no-member
+            image = cv2_read_img(src, raise_error=True)
         return image
 
     def load_video_frame(self, filename):
         """ Load a requested frame from video """
         frame = os.path.splitext(filename)[0]
         logger.trace("Loading video frame: '%s'", frame)
-        frame_no = int(frame[frame.rfind("_") + 1:])
+        frame_no = int(frame[frame.rfind("_") + 1:]) - 1
         self.vid_cap.set(cv2.CAP_PROP_POS_FRAMES, frame_no)  # pylint: disable=no-member
         _, image = self.vid_cap.read()
         return image
@@ -274,12 +275,11 @@ class Frames(MediaLoader):
 class ExtractedFaces():
     """ Holds the extracted faces and matrix for
         alignments """
-    def __init__(self, frames, alignments, size=256,
-                 padding=48, align_eyes=False):
-        logger.trace("Initializing %s: (size: %s, padding: %s, align_eyes: %s)",
-                     self.__class__.__name__, size, padding, align_eyes)
+    def __init__(self, frames, alignments, size=256, align_eyes=False):
+        logger.trace("Initializing %s: (size: %s, align_eyes: %s)",
+                     self.__class__.__name__, size, align_eyes)
         self.size = size
-        self.padding = padding
+        self.padding = int(size * 0.1875)
         self.align_eyes = align_eyes
         self.alignments = alignments
         self.frames = frames
@@ -309,10 +309,7 @@ class ExtractedFaces():
                      self.current_frame, alignment)
         face = DetectedFace()
         face.from_alignment(alignment, image=image)
-        face.load_aligned(image,
-                          size=self.size,
-                          padding=self.padding,
-                          align_eyes=self.align_eyes)
+        face.load_aligned(image, size=self.size, align_eyes=self.align_eyes)
         return face
 
     def get_faces_in_frame(self, frame, update=False):
@@ -330,7 +327,8 @@ class ExtractedFaces():
             self.get_faces(frame)
         sizes = list()
         for face in self.faces:
-            top_left, top_right = face.original_roi[0], face.original_roi[3]
+            roi = face.original_roi.squeeze()
+            top_left, top_right = roi[0], roi[3]
             len_x = top_right[0] - top_left[0]
             len_y = top_right[1] - top_left[1]
             if top_left[1] == top_right[1]:
